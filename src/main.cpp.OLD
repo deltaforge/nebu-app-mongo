@@ -1,0 +1,191 @@
+
+#include "nebuClient.h"
+#include "virtRequest.h"
+#include "virtualMachine.h"
+
+#include "mongo/client/dbclient.h"
+#include "mongo/bson/bson.h"
+
+#include "mongodDaemon.h"
+
+#include <iostream>
+#include <map>
+#include <unistd.h>
+
+using std::make_shared;
+using std::shared_ptr;
+using std::string;
+using std::vector;
+using std::map;
+
+using mongo::BSONElement;
+using mongo::BSONObj;
+using mongo::BSONObjBuilder;
+using mongo::DBClientConnection;
+
+using nebu::common::NebuClient;
+using nebu::common::VirtRequest;
+using nebu::common::VirtualMachine;
+using nebu::common::VMStatus;
+
+const string MONGOS_PORT = "27017";
+const string MONGOCFG_PORT = "27018";
+const string MONGOD_PORT = "27019";
+
+map<string, shared_ptr<VirtualMachine>> VMlist;
+
+map<string, shared_ptr<VirtualMachine>> deployed_config;
+map<string, shared_ptr<VirtualMachine>> deployed_mongod;
+map<string, shared_ptr<VirtualMachine>> rogueVMs;
+
+bool deployed_mongos = false;
+int replSetNextID = 0;
+
+bool containsKey(const map<string, shared_ptr<VirtualMachine>> &map, const string &key) {
+	return map.find(key) != map.end();
+}
+
+void retrieveVMs(shared_ptr<NebuClient> client) {
+	VirtRequest req(client);
+	vector<string> ids = req.getVirtualMachineIDs();
+
+	for (vector<string>::iterator it = ids.begin(); it != ids.end(); it++) {
+		if (containsKey(VMlist, *it)) {
+			continue;
+		}
+
+		shared_ptr<VirtualMachine> vm = std::make_shared<VirtualMachine>(req.getVirtualMachine(*it));
+		if (vm->getStatus() == VMStatus::ON) {
+			std::cout << "Detected a VM:" << std::endl;
+			std::cout << "\tHostname: " << vm->getHostname() << std::endl;
+			std::cout << "\tUUID: " << vm->getUUID() << std::endl;
+			rogueVMs[*it] = vm;
+			VMlist[*it] = vm;
+		}
+	}
+}
+
+string mongodIP(shared_ptr<VirtualMachine> vm) {
+	return vm->getHostname() + ":" + MONGOD_PORT;
+}
+
+string mongosIP(shared_ptr<VirtualMachine> vm) {
+	return vm->getHostname() + ":" + MONGOS_PORT;
+}
+
+string mongocfgIP(shared_ptr<VirtualMachine> vm) {
+	return vm->getHostname() + ":" + MONGOCFG_PORT;
+}
+
+void sshToVM(shared_ptr<VirtualMachine> vm, string command) {
+	string ssh_command = "ssh mongo@" + vm->getHostname() + " '" + command + "'";
+	system(ssh_command.c_str());
+}
+
+void deployConfigServer(shared_ptr<VirtualMachine> vm) {
+	string command = "mongod --fork --configsvr --dbpath /data/mongo/configsvr --port " + MONGOCFG_PORT;
+	sshToVM(vm, command);
+
+	deployed_config[vm->getUUID()] = vm;
+	rogueVMs.erase(vm->getUUID());
+}
+
+BSONObj mongoCommandToVM(const string &ip, const BSONObj &bsonCommand) {
+	DBClientConnection db;
+	db.connect(ip);
+
+	BSONObj output;
+	
+	db.runCommand("admin", bsonCommand, output);
+}
+
+void deployMongosServer(shared_ptr<VirtualMachine> vm) {
+	string command = "mongos --fork --port " + MONGOS_PORT + " --configdb ";
+
+	for (map<string, shared_ptr<VirtualMachine>>::iterator it = deployed_config.begin();
+			it != deployed_config.end(); it++) {
+		command += mongocfgIP(it->second) + ",";
+	}
+	
+	command.erase(command.end() - 1, command.end());
+	sshToVM(vm, command);
+}
+
+void deployReplica(shared_ptr<VirtualMachine> vm, string replSetName) {
+	string command = "mongod --fork --dbpath /data/mongo/" + replSetName + " --replSet " + replSetName + " --port " + MONGOD_PORT;
+	sshToVM(vm, command);
+
+	deployed_mongod[vm->getUUID()] = vm;
+	rogueVMs.erase(vm->getUUID());
+}
+
+void deployReplSet(shared_ptr<VirtualMachine> vmA, shared_ptr<VirtualMachine> vmB, shared_ptr<VirtualMachine> vmC) {
+	string replSet = "rs" + replSetNextID;
+	replSetNextID++;
+
+	deployReplica(vmA, replSet);
+	deployReplica(vmB, replSet);
+	deployReplica(vmC, replSet);
+
+	BSONObj initiateCmd = BSON(
+			"replSetInitiate" << BSON(
+				"_id" << replSet <<
+				"members" << BSON_ARRAY(
+					BSON("_id" << 0 << "host" << mongodIP(vmA)) <<
+					BSON("_id" << 1 << "host" << mongodIP(vmB)) <<
+					BSON("_id" << 2 << "host" << mongodIP(vmC))
+				)
+			)
+		);
+	mongoCommandToVM(mongodIP(vmA), initiateCmd);
+
+	BSONObj addShardCmd = BSON(
+			"addShard" << (
+				mongodIP(vmA) + "," +
+				mongodIP(vmB) + "," +
+				mongodIP(vmC)
+			)
+		);
+	mongoCommandToVM(mongosIP(deployed_config.begin()->second), addShardCmd);
+}
+
+// SLEEP_TIME defined in ms
+#define SLEEP_TIME 10000
+
+int main(int argc, char *argv[]) {
+	shared_ptr<NebuClient> client = make_shared<NebuClient>("http://localhost:8080");
+	VirtRequest req(client);
+	
+	while (1) {
+		retrieveVMs(client);
+		
+		while (deployed_config.size() < 3 && !rogueVMs.empty()) {
+			deployConfigServer(rogueVMs[rogueVMs.begin()->first]);
+		}
+
+		if (!deployed_mongos && deployed_config.size() == 3) {
+			for (map<string, shared_ptr<VirtualMachine>>::iterator it = deployed_config.begin();
+					it != deployed_config.end(); it++) {
+				deployMongosServer(it->second);
+			}
+		}
+
+		while (rogueVMs.size() >= 3) {
+			map<string, shared_ptr<VirtualMachine>>::iterator it = rogueVMs.begin();
+			shared_ptr<VirtualMachine> vmA = it->second; it++;
+			shared_ptr<VirtualMachine> vmB = it->second; it++;
+			shared_ptr<VirtualMachine> vmC = it->second;
+
+			deployReplSet(vmA, vmB, vmC);
+		}
+
+		sleep(SLEEP_TIME);
+	}
+
+//	vector<string> ids = req.getVirtualMachineIDs();
+//	for (vector<string>::iterator it = ids.begin(); it != ids.end(); it++) {
+//		std::cout << *it << std::endl;
+//	}
+
+	return 0;
+}
